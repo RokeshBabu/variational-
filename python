@@ -1,0 +1,158 @@
+# =========================================
+# Variational Autoencoder for Anomaly Detection
+# Advanced, End-to-End, Production-Style Code
+# =========================================
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+import numpy as np
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+
+# -------------------------
+# Config
+# -------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 128
+LATENT_DIM = 20
+EPOCHS = 30
+LR = 1e-3
+BETA = 4.0          # β-VAE parameter
+ANOMALY_LABEL = 0  # e.g., detect "0" as anomaly in MNIST
+
+# -------------------------
+# Data
+# -------------------------
+transform = transforms.ToTensor()
+
+train_dataset = datasets.MNIST(
+    root="./data", train=True, download=True, transform=transform
+)
+
+test_dataset = datasets.MNIST(
+    root="./data", train=False, download=True, transform=transform
+)
+
+# Train only on NORMAL data
+train_data = [(x, y) for x, y in train_dataset if y != ANOMALY_LABEL]
+test_data = test_dataset
+
+train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False)
+
+# -------------------------
+# VAE Model
+# -------------------------
+class VAE(nn.Module):
+    def __init__(self, latent_dim):
+        super().__init__()
+
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(784, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU()
+        )
+
+        self.mu = nn.Linear(256, latent_dim)
+        self.logvar = nn.Linear(256, latent_dim)
+
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Linear(512, 784),
+            nn.Sigmoid()
+        )
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        x = x.view(-1, 784)
+        h = self.encoder(x)
+        mu, logvar = self.mu(h), self.logvar(h)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decoder(z)
+        return recon, mu, logvar
+
+# -------------------------
+# Loss Function (β-VAE)
+# -------------------------
+def vae_loss(recon, x, mu, logvar):
+    recon_loss = nn.functional.mse_loss(
+        recon, x.view(-1, 784), reduction="sum"
+    )
+    kl_div = -0.5 * torch.sum(
+        1 + logvar - mu.pow(2) - logvar.exp()
+    )
+    return recon_loss + BETA * kl_div
+
+# -------------------------
+# Training
+# -------------------------
+model = VAE(LATENT_DIM).to(DEVICE)
+optimizer = optim.Adam(model.parameters(), lr=LR)
+
+model.train()
+for epoch in range(EPOCHS):
+    total_loss = 0
+    for x, _ in train_loader:
+        x = x.to(DEVICE)
+        optimizer.zero_grad()
+        recon, mu, logvar = model(x)
+        loss = vae_loss(recon, x, mu, logvar)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+    print(f"Epoch [{epoch+1}/{EPOCHS}], Loss: {total_loss / len(train_loader.dataset):.4f}")
+
+# -------------------------
+# Anomaly Scoring
+# -------------------------
+model.eval()
+scores = []
+labels = []
+
+with torch.no_grad():
+    for x, y in test_loader:
+        x = x.to(DEVICE)
+        recon, _, _ = model(x)
+        error = torch.mean((x.view(-1, 784) - recon) ** 2, dim=1)
+
+        scores.extend(error.cpu().numpy())
+        labels.extend((y == ANOMALY_LABEL).numpy())
+
+scores = np.array(scores)
+labels = np.array(labels)
+
+# -------------------------
+# Metrics
+# -------------------------
+roc = roc_auc_score(labels, scores)
+
+precision, recall, _ = precision_recall_curve(labels, scores)
+pr_auc = auc(recall, precision)
+
+print("\n--- Anomaly Detection Performance ---")
+print(f"ROC-AUC: {roc:.4f}")
+print(f"PR-AUC : {pr_auc:.4f}")
+
+# -------------------------
+# Latent Space Analysis
+# -------------------------
+def sample_latent(model, n=10):
+    z = torch.randn(n, LATENT_DIM).to(DEVICE)
+    samples = model.decoder(z)
+    return samples.view(-1, 1, 28, 28)
+
+latent_samples = sample_latent(model)
